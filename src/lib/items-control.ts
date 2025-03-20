@@ -1,8 +1,7 @@
 import { BindableControl } from "./bindable-control.js";
-import { addArrayListener, getTracker, removeArrayListener } from "./dependency-tracking.js";
+import { addArrayListener, getTracker } from "./dependency-tracking.js";
 import { findTemplateById, getTypeName } from "./dom-utilities.js";
 import { HtmlControl, HtmlControlBindableProperty } from "./html-control.js";
-import { enqueTask } from "./task-queue.js";
 
 const standardTemplate = document.createElement('template');
 standardTemplate.innerHTML = '<text-block text="this"></text-block>';
@@ -10,13 +9,18 @@ standardTemplate.innerHTML = '<text-block text="this"></text-block>';
 const shadowHtml = '<slot name="item-template"></slot><slot name="item-container-template"><template><model-control></model-control></template></slot><div part="container"></div>';
 
 export class ItemsControl extends HtmlControl implements HtmlControlBindableProperty<'items', Iterable<any>>, HtmlControlBindableProperty<'itemToTemplateId', (item: any) => string> {
-    static override bindableProperties = [...HtmlControl.bindableProperties, 'items', 'itemToTemplateId'];
+    static override bindableProperties = [...HtmlControl.bindableProperties, 'items', 'itemToTemplateId', 'virtualized'];
 
     #displayedItems?: Iterable<any>;
     #slotCount = 0;
     #itemToTemplateId?: (item: any) => string;
-    #recentlyDeleted?: Map<any, BindableControl>;
-    #lastUsedItemToTemplateId?: ((item: any) => string);
+    #virtualized = false;
+
+    // For virtualization
+    #renderedItems = new Set<number>();
+    #intersectionObserverBottom?: IntersectionObserver;
+    #deletedItems = new Set<number>(); 
+    #itemWasRecentlyDeleted = false;
 
     constructor() {
         super();
@@ -37,9 +41,14 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
 
     #assignedElementsCache?: Element[];
 
-    #rebuildItems () {
+    #rebuildItems() {
         this.#assignedElementsCache = undefined;
         this.#itemContainerTemplate = undefined;
+
+        // If virtualized and items have already been rendered, don't rebuild
+        if (this.virtualized && this.#renderedItems.size > 0) {
+            return;
+        }
 
         if (this.#displayedItems === undefined) return;
 
@@ -55,13 +64,12 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
         }
         div.innerHTML = '';
 
+        // Original non-virtualized rendering logic
         for (const item of this.#displayedItems) {
             const ctl = this.createItemContainer();
-
             const template = this.#getItemTemplateContent(item);
-
             ctl.append(template.cloneNode(true));
-            ctl.model = item; // safe as we are descendant of BindableControl so if we are created then so is BindalbeControl
+            ctl.model = item;
 
             const slotName = 'i-' + this.#slotCount++;
 
@@ -83,8 +91,7 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
     }
 
     get itemToTemplateId(): ((item: any) => string) | undefined {
-        this.#lastUsedItemToTemplateId = this.getProperty('itemToTemplateId', this.#itemToTemplateId);
-        return this.#lastUsedItemToTemplateId;
+        return this.getProperty('itemToTemplateId', this.#itemToTemplateId);
     }
 
     set itemToTemplateId(func: ((item: any) => string) | undefined) {
@@ -94,11 +101,7 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
     }
 
     onItemToTemplateIdChanged() {
-        const prev = this.#lastUsedItemToTemplateId;
-        const current = this.itemToTemplateId;
-        if (prev !== current) {
-            this.#rebuildItems();
-        }
+        this.#rebuildItems();
     }
 
     getItemToTemplateId(item: any): string {
@@ -153,6 +156,14 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
     }
 
     onItemsChanged() {
+        if (this.virtualized) {
+            this.onItemsChangedVirtualized();
+        } else {
+            this.onItemsChangedOriginal();
+        }
+    }
+
+    onItemsChangedVirtualized() {
         let items: Iterable<any> | undefined;
         try {
             items = this.items;
@@ -166,20 +177,137 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
         if (Array.isArray(this.#displayedItems)) {
             const tracker = getTracker(this.#displayedItems);
             if (tracker !== undefined) {
-                tracker[removeArrayListener](this.#onArrayChanged);
+                tracker[addArrayListener](this.#onArrayChanged);
             }
         }
 
         const div = this.itemsContainer;
+        for (const slot of div.children) {
+            for (const el of (slot as HTMLSlotElement).assignedElements()) el.remove();
+        }
+        div.innerHTML = '';
 
-        let chNum = div.children.length;
+        let chNum = this.children.length;
         while (chNum-- > 0) {
-            const ch = div.children[chNum];
+            const ch = this.children[chNum];
 
-            if (ch instanceof HTMLSlotElement && ch.name.startsWith('i-')) {
-                for(const x of ch.assignedElements()) x.remove();
-                ch.remove();
+            if (ch instanceof HTMLSlotElement && ch.name.startsWith('i-')) ch.remove();
+        }
+
+        this.#displayedItems = items;
+        this.#renderedItems.clear();
+        this.#deletedItems.clear();
+
+        if (items !== undefined) {
+            let count = 0;
+            let index = 0;
+            for (const _ of items) {
+                if (count >= 100) break;
+                this.#renderItemAtIndex(index, items);
+                index++;
+                count++;
             }
+            
+            const sentinelBottom = document.createElement('div');
+            sentinelBottom.setAttribute('data-index', index.toString());
+            sentinelBottom.setAttribute('data-sentinel', 'bottom');
+            sentinelBottom.style.height = '20px';
+            sentinelBottom.style.background = 'red';
+            sentinelBottom.style.border = '2px dashed black';
+            sentinelBottom.textContent = 'granica donja';
+            sentinelBottom.style.color = 'white';
+            sentinelBottom.style.textAlign = 'center';
+            sentinelBottom.style.fontWeight = 'bold';
+            sentinelBottom.style.padding = '2px';
+            sentinelBottom.style.margin = '5px 0';
+
+            const sentinelTop = document.createElement('div');
+            sentinelTop.setAttribute('data-index', 'top');
+            sentinelTop.setAttribute('data-sentinel', 'top');
+            sentinelTop.style.height = '20px';
+            sentinelTop.style.background = 'blue';
+            sentinelTop.style.border = '2px dashed black';
+            sentinelTop.textContent = 'granica gornja';
+            sentinelTop.style.color = 'white';
+            sentinelTop.style.textAlign = 'center';
+            sentinelTop.style.fontWeight = 'bold';
+            sentinelTop.style.padding = '2px';
+            sentinelTop.style.margin = '5px 0';
+
+            if (div.firstChild) {
+                div.insertBefore(sentinelTop, div.firstChild);
+            } else {
+                div.appendChild(sentinelTop);
+            }
+            div.appendChild(sentinelBottom);
+
+
+            this.#intersectionObserverBottom?.disconnect();
+            this.#intersectionObserverBottom = new IntersectionObserver((entries) => {
+                for (const entry of entries) {
+                    const target = entry.target;
+                    const index = parseInt(target.getAttribute('data-index') || '');
+                    
+                    if (entry.isIntersecting) {
+                        if (this.#itemWasRecentlyDeleted) {
+                            const newIndex = index + 1;
+                            target.setAttribute('data-index', newIndex.toString());
+                            console.log(`Bottom sentinel incremented: index ${index} → ${newIndex}`);
+                            this.#intersectionObserverBottom?.unobserve(target);
+                            this.#intersectionObserverBottom?.observe(target);
+                            this.#itemWasRecentlyDeleted = false; // Reset the trigger
+                            this.#renderItemAtIndex(newIndex, items);
+                        } else {
+                            this.#renderItemAtIndex(index, items);
+                        }
+                    }
+                    else if(!entry.isIntersecting) {
+                        this.#removeItemAtIndex(index, items);
+                        console.log(index);
+                        entry.target.setAttribute('data-index', (index - 1).toString());
+                        console.log(`Bottom sentinel updated: index ${index} → ${index - 1}`);
+                        this.#itemWasRecentlyDeleted = true; // Set the trigger
+                        this.#intersectionObserverBottom?.unobserve(entry.target);
+                        this.#intersectionObserverBottom?.observe(entry.target);
+                    }
+                }
+            }, {
+                rootMargin: '200px 0px'
+            });
+            
+            this.#intersectionObserverBottom.observe(sentinelBottom);
+        }
+    }
+    
+    onItemsChangedOriginal() {
+        let items: Iterable<any> | undefined;
+        try {
+            items = this.items;
+        }
+        catch {
+            items = undefined;
+        }
+
+        if (items === this.#displayedItems) return;
+
+        if (Array.isArray(this.#displayedItems)) {
+            const tracker = getTracker(this.#displayedItems);
+            if (tracker !== undefined) {
+                tracker[addArrayListener](this.#onArrayChanged);
+            }
+        }
+
+        const div = this.itemsContainer;
+        for (const slot of div.children) {
+            for (const el of (slot as HTMLSlotElement).assignedElements()) el.remove();
+        }
+        div.innerHTML = '';
+
+        let chNum = this.children.length;
+        while (chNum-- > 0) {
+            const ch = this.children[chNum];
+
+            if (ch instanceof HTMLSlotElement && ch.name.startsWith('i-')) ch.remove();
         }
 
         this.#displayedItems = items;
@@ -210,7 +338,7 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
         }
     }
 
-    #onArrayChanged = (arr: any[], index: number, inserted: number, deleted: number, deletedItems: any | any[] | undefined) => {
+    #onArrayChanged = (arr: any[], index: number, inserted: number, deleted: number) => {
         const div = this.itemsContainer;
 
         let same = Math.min(inserted, deleted);
@@ -235,19 +363,13 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
         while(inserted-- > 0) {
             const item = arr[index];
 
-            let ctl = this.#recentlyDeleted?.get(item);
-            if (ctl === undefined) {
-                ctl = this.createItemContainer();
-                const template = this.#getItemTemplateContent(item);
-                ctl.append(template.cloneNode(true));
-            }
-            else {
-                this.#recentlyDeleted!.delete(item);
-            }
-
+            const ctl = this.createItemContainer();
+            const template = this.#getItemTemplateContent(item);
+            ctl.append(template.cloneNode(true));
             ctl.model = item; // safe as we are descendant of BindableControl so if we are created then so is BindalbeControl
 
             const slotName = 'i-' + this.#slotCount++;
+
             ctl.slot = slotName;
             this.appendChild(ctl);
 
@@ -266,21 +388,12 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
 
         while(deleted > 0) {
             const slot = div.children[index + --deleted] as HTMLSlotElement;
-            const assigned = slot.assignedElements();
-            if (assigned.length !== 1) throw new Error('Unexpected state.');
-            const model = assigned[0] as BindableControl;
-            if (this.#recentlyDeleted === undefined) {
-                this.#recentlyDeleted = new Map();
-                enqueTask(ItemsControl.#clearRecentlyDeletedCallback, this);
-            }
-            this.#recentlyDeleted.set(model.model, model);
-            model.remove();
+            for (const assigned of slot.assignedElements()) assigned.remove();
             slot.remove();
         }
     };
 
     override onDisconnectedFromDom(): void {
-        this.#recentlyDeleted = undefined;
         super.onDisconnectedFromDom();
         this.onItemsChanged();
         this.#lastUsedTemplate = undefined;
@@ -310,7 +423,97 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
         this.#lastUsedTemplate = undefined;
     }
 
-    static #clearRecentlyDeletedCallback(ctl: ItemsControl) {
-        ctl.#recentlyDeleted = undefined;
+    get virtualized(): boolean | undefined {
+        return this.getProperty('virtualized', this.#virtualized);
+    }
+
+    set virtualized(value: boolean) {
+        const prev = this.#virtualized;
+        this.#virtualized = value;
+        this.notifyPropertySetExplicitly('virtualized', prev, value);
+    }
+
+    static override get observedAttributes() {
+        return ['virtualized'];
+    }
+
+    override attributeChangedCallback(name: string, oldValue: string, newValue: string) {
+        super.attributeChangedCallback(name, oldValue, newValue);
+        if (name === 'virtualized') {
+            this.virtualized = newValue !== null;
+        }
+    }
+
+    #renderItemAtIndex(index: number, items: Iterable<any>) {
+        if (this.#renderedItems.has(index)) return;
+
+        let currentIndex = 0;
+        let targetItem;
+        for (const item of items) {
+            if (currentIndex === index) {
+                targetItem = item;
+                break;
+            }
+            currentIndex++;
+        }
+        if (targetItem === undefined) return;
+
+        const ctl = this.createItemContainer();
+        const template = this.#getItemTemplateContent(targetItem);
+        ctl.append(template.cloneNode(true));
+        ctl.model = targetItem;
+
+        const slotName = 'i-' + this.#slotCount++;
+        ctl.slot = slotName;
+        this.appendChild(ctl);
+
+        const slot = document.createElement('slot');
+        slot.name = slotName;
+        slot.setAttribute('data-item-index', index.toString());
+        
+        const sentinel = this.itemsContainer.querySelector(`[data-index="${index}"]`);
+        if (sentinel) {
+            sentinel.before(slot);
+            sentinel.setAttribute('data-index', (index + 1).toString());
+            this.#intersectionObserverBottom?.unobserve(sentinel);
+            this.#intersectionObserverBottom?.observe(sentinel);
+        } else {
+            this.itemsContainer.appendChild(slot);
+        }
+
+        this.#renderedItems.add(index);
+        this.#deletedItems.delete(index);
+    }
+
+    #removeItemAtIndex(index: number, items: Iterable<any>) {
+        if (!this.#renderedItems.has(index)) return;
+        
+        let currentIndex = 0;
+        let targetItem;
+        for (const item of items) {
+            if (currentIndex === index) {
+                targetItem = item;
+                break;
+            }
+            currentIndex++;
+        }
+        if (targetItem === undefined) return;
+    
+        const slots = this.itemsContainer.querySelectorAll('slot[name^="i-"]');
+        
+        for (const slot of slots) {
+            const elements = (slot as HTMLSlotElement).assignedElements();
+            if (elements.length === 0) continue;
+            
+            if ((elements[0] as any).model === targetItem) {
+                elements[0].remove();
+                slot.remove();
+                this.#renderedItems.delete(index);
+                this.#deletedItems.add(index);
+                this.#itemWasRecentlyDeleted = true; // Also set the trigger here
+                
+                return;
+            }
+        }
     }
 }
