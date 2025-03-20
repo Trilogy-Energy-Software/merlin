@@ -1,5 +1,5 @@
 import { BindableControl } from "./bindable-control.js";
-import { addArrayListener, getTracker } from "./dependency-tracking.js";
+import { addArrayListener, getTracker, removeArrayListener  } from "./dependency-tracking.js";
 import { findTemplateById, getTypeName } from "./dom-utilities.js";
 import { HtmlControl, HtmlControlBindableProperty } from "./html-control.js";
 
@@ -177,7 +177,7 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
         if (Array.isArray(this.#displayedItems)) {
             const tracker = getTracker(this.#displayedItems);
             if (tracker !== undefined) {
-                tracker[addArrayListener](this.#onArrayChanged);
+                tracker[removeArrayListener](this.#onArrayChanged);
             }
         }
 
@@ -293,7 +293,7 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
         if (Array.isArray(this.#displayedItems)) {
             const tracker = getTracker(this.#displayedItems);
             if (tracker !== undefined) {
-                tracker[addArrayListener](this.#onArrayChanged);
+                tracker[removeArrayListener](this.#onArrayChanged);
             }
         }
 
