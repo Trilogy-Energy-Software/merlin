@@ -152,6 +152,10 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
         return this.shadowRoot!.querySelector('div[part="container"]')!;
     }
 
+    getItemElement(idx: number): BindableControl {
+        return (this.itemsContainer.children[idx] as HTMLSlotElement).assignedElements()[0] as BindableControl;
+    }
+
     onItemsChanged() {
         let items: Iterable<any> | undefined;
         try {
