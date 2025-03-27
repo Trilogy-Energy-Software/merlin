@@ -69,6 +69,7 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
             this.appendChild(ctl);
 
             const slot = document.createElement('slot');
+            slot.part.add('item');
             slot.name = slotName;
             div.appendChild(slot);
         }
@@ -208,6 +209,7 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
                 this.appendChild(ctl);
 
                 const slot = document.createElement('slot');
+                slot.part.add('item');
                 slot.name = slotName;
                 div.appendChild(slot);
             }
@@ -256,6 +258,7 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
             this.appendChild(ctl);
 
             const slot = document.createElement('slot');
+            slot.part.add('item');
             slot.name = slotName;
 
             if (index < div.childElementCount) {
@@ -303,11 +306,14 @@ export class ItemsControl extends HtmlControl implements HtmlControlBindableProp
             const ch = this.#itemContainerTemplate.content.firstElementChild;
             if (ch !== null) {
                 const maybe = document.importNode(ch, true);
-                if (maybe instanceof BindableControl) return maybe;
+                if (maybe instanceof BindableControl) {
+                    return maybe;
+                }
             }
         }
         
-        return document.createElement('model-control') as BindableControl;
+        const ret = document.createElement('model-control') as BindableControl;
+        return ret;
     }
 
     override onAncestorsChanged(): void {
